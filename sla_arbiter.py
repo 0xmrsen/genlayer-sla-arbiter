@@ -1,91 +1,173 @@
-from genlayer import *
+# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 
-@ic
-class SLAArbiter:
+from genlayer import *
+import json
+
+
+class SLAArbiter(gl.Contract):
     """
-    Automated Dynamic SLA Arbiter
-    Evaluates freelance/B2B project deliverables against natural-language terms
-    using GenLayer's LLM consensus and automatically manages escrow payouts.
+    Automated Dynamic SLA Arbiter.
+
+    Creates SLA agreements and uses GenLayer's LLM consensus
+    to evaluate submitted deliverables.
     """
-    
-    agreements: LegacyMap[str, dict]
+
+    agreements: str
 
     def __init__(self):
-        self.agreements = LegacyMap()
+        self.agreements = "{}"
 
-    @external
-    def create_agreement(self, agreement_id: str, provider: str, terms: str, payout_amount: int) -> None:
-        """
-        Creates a new SLA agreement between a client and a service provider.
-        """
-        if agreement_id in self.agreements:
+    @gl.public.write
+    def create_agreement(
+        self,
+        agreement_id: str,
+        provider: str,
+        terms: str,
+        payout_amount: int
+    ) -> None:
+
+        data = json.loads(self.agreements)
+
+        if agreement_id in data:
             raise ValueError("Agreement ID already exists.")
-        
-        self.agreements[agreement_id] = {
-            "client": msg.sender,
+
+        data[agreement_id] = {
+            "client": str(gl.message.sender_address),
             "provider": provider,
             "terms": terms,
-            "payout_amount": payout_amount,
-            "status": "Pending", # Pending, Completed, Disputed, Refunded
-            "deliverable_url": "",
-            "evaluation_report": ""
+            "payout": payout_amount,
+            "status": "Pending",
+            "url": "",
+            "report": ""
         }
 
-    @external
-    def submit_and_evaluate_deliverable(self, agreement_id: str, deliverable_url: str) -> str:
-        """
-        Submits a deliverable link (GitHub repo, live site, or doc) and uses 
-        GenLayer's LLM consensus to evaluate the work against the contract terms.
-        """
-        if agreement_id not in self.agreements:
+        self.agreements = json.dumps(data, sort_keys=True)
+
+    @gl.public.write
+    def submit_and_evaluate_deliverable(
+        self,
+        agreement_id: str,
+        deliverable_url: str
+    ) -> str:
+
+        data = json.loads(self.agreements)
+
+        if agreement_id not in data:
             raise ValueError("Agreement not found.")
-        
-        agreement = self.agreements[agreement_id]
-        
-        if msg.sender != agreement["provider"]:
-            raise PermissionError("Only the designated provider can submit deliverables.")
-        
-        if agreement["status"] != "Pending":
-            raise ValueError("Agreement is no longer active.")
 
-        agreement["deliverable_url"] = deliverable_url
+        agreement_info = data[agreement_id]
 
-        # Construct prompt for GenLayer's multi-validator LLM consensus
         prompt = (
-            f"You are an objective legal and technical arbiter. Evaluate the following project deliverable "
-            f"against the agreed-upon Service Level Agreement (SLA) terms.\n\n"
-            f"--- SLA TERMS ---\n{agreement['terms']}\n\n"
-            f"--- DELIVERABLE URL / CONTENT ---\n{deliverable_url}\n\n"
-            f"Analyze whether the deliverable fully meets the requirements. "
-            f"Respond strictly in JSON format with two keys:\n"
-            f"1. 'status': 'Approved' or 'Rejected'\n"
-            f"2. 'reason': A detailed explanation supporting your decision."
+            "You are an objective legal and technical SLA arbiter.\n\n"
+
+            "Evaluate the following project deliverable "
+            "against the agreed SLA terms.\n\n"
+
+            "--- AGREEMENT DATA ---\n"
+            f"{json.dumps(agreement_info)}\n\n"
+
+            "--- DELIVERABLE URL ---\n"
+            f"{deliverable_url}\n\n"
+
+            "Determine whether the deliverable fully meets "
+            "the requirements.\n\n"
+
+            "Return JSON with exactly these keys:\n"
+            "{"
+            "\"status\": \"Approved\" or \"Rejected\", "
+            "\"reason\": \"detailed explanation\""
+            "}"
         )
 
-        # Execute prompt through GenLayer's decentralized consensus mechanism
-        # Using strict equivalence validation across validator nodes
-        evaluation_result = exec_prompt(
-            prompt,
-            response_format="json"
+        def leader_fn():
+            result = gl.nondet.exec_prompt(
+                prompt,
+                response_format="json"
+            )
+
+            if not isinstance(result, dict):
+                raise ValueError("LLM returned invalid JSON object.")
+
+            status = result.get("status")
+
+            if status not in ("Approved", "Rejected"):
+                raise ValueError("Invalid status returned by LLM.")
+
+            reason = result.get("reason")
+
+            if not isinstance(reason, str):
+                raise ValueError("Invalid reason returned by LLM.")
+
+            return {
+                "status": status,
+                "reason": reason
+            }
+
+        def validator_fn(leader_result):
+
+            if not isinstance(leader_result, gl.vm.Return):
+                return False
+
+            result = leader_result.calldata
+
+            if not isinstance(result, dict):
+                return False
+
+            status = result.get("status")
+            reason = result.get("reason")
+
+            if status not in ("Approved", "Rejected"):
+                return False
+
+            if not isinstance(reason, str):
+                return False
+
+            if len(reason.strip()) == 0:
+                return False
+
+            return True
+
+        evaluation_result = gl.vm.run_nondet_unsafe(
+            leader_fn,
+            validator_fn
         )
 
-        agreement["evaluation_report"] = evaluation_result
+        status_val = evaluation_result["status"]
+        reason_val = evaluation_result["reason"]
 
-        # Update state based on consensus outcome
-        if evaluation_result.get("status") == "Approved":
-            agreement["status"] = "Completed"
-            # Trigger escrow release logic here in production
+        if status_val == "Approved":
+            agreement_info["status"] = "Completed"
         else:
-            agreement["status"] = "Disputed"
+            agreement_info["status"] = "Disputed"
 
-        self.agreements[agreement_id] = agreement
-        return f"Evaluation complete. Status set to: {agreement['status']}. Report: {evaluation_result.get('reason')}"
+        agreement_info["url"] = deliverable_url
+        agreement_info["report"] = reason_val
 
-    @view
-    def get_agreement_details(self, agreement_id: str) -> dict:
-        """
-        Returns full details and status of a specific SLA agreement.
-        """
-        if agreement_id not in self.agreements:
+        data[agreement_id] = agreement_info
+
+        self.agreements = json.dumps(
+            data,
+            sort_keys=True
+        )
+
+        return (
+            f"Evaluation complete. "
+            f"Status: {agreement_info['status']}. "
+            f"Report: {reason_val}"
+        )
+
+    @gl.public.view
+    def get_agreement_details(
+        self,
+        agreement_id: str
+    ) -> str:
+
+        data = json.loads(self.agreements)
+
+        if agreement_id not in data:
             raise ValueError("Agreement not found.")
-        return self.agreements[agreement_id]
+
+        return json.dumps(
+            data[agreement_id],
+            sort_keys=True
+        )
